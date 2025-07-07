@@ -23,16 +23,6 @@
 #'
 #' @export
 #' @import dplyr survival nloptr
-required_packages <- c("dplyr", "survival", "nloptr")
-install_if_missing <- function(pkg) {
-  if (!requireNamespace(pkg, quietly = TRUE)) {
-    install.packages(pkg, dependencies = TRUE)
-  }
-  library(pkg, character.only = TRUE)
-}
-
-# Apply to each package
-invisible(lapply(required_packages, install_if_missing))
 PAFT_TD <- function(formula, data, id_var = "ID", 
                     dist = "lognormal",                # flexible distribution
                     initi = FALSE, beta = NA, sigma_init = NA,
