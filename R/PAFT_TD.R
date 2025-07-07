@@ -23,116 +23,135 @@
 #'
 #' @export
 #' @import dplyr survival nloptr
-PAFT_TD <- function(formula, data, id, dist = "lognormal", init = NULL,
-                    control = list(maxiter = 2000, tol = 1e-5, algorithm = "NLOPT_LN_COBYLA")) {
+PAFT_TD <- function(formula, data, id_var = "ID", 
+                    dist = "lognormal",                # flexible distribution
+                    initi = FALSE, beta = NA, sigma_init = NA,
+                    tol = 1.0e-5, maxiter = 2000,
+                    algorithm = "NLOPT_LN_COBYLA") {
   
-  call <- match.call()
+ 
+  # --- Distribution-specific log-likelihood component --- #
+  get_loglik_function <- function(dist) {
+    switch(dist,
+           "lognormal" = function(z, psi, psi_d, delta, sigma) {
+             f <- dnorm(z) * (psi_d / (sigma * psi))
+             S <- 1 - pnorm(z)
+             delta * f + (1 - delta) * S
+           },
+           stop("Unsupported distribution: ", dist))
+  }
+  loglik_fn <- get_loglik_function(dist)
   
-  # ID variable name
-  id_var <- deparse(substitute(id))
-  
-  # Extract formula variables
-  all_vars <- all.vars(formula)
-  time_var <- all_vars[2]
-  event_var <- all_vars[3]
-  covariates <- if (length(all_vars) > 3) all_vars[4:length(all_vars)] else NULL
-  
-  # Last row per subject
-  data_last <- data %>%
-    group_by(.data[[id_var]]) %>%
-    arrange(.data[[time_var]]) %>%
-    slice_tail(n = 1) %>%
-    ungroup() %>%
-    select(ID = all_of(id_var), Time = all_of(time_var), Event = all_of(event_var), all_of(covariates))
-  
-  # Time-dependency check
-  is_time_dependent <- if (is.null(covariates)) FALSE else
-    nrow(distinct(data[, c(id_var, covariates)])) != nrow(data_last)
-  
-  # Case 1: Time-independent
-  if (!is_time_dependent) {
-    aft_formula <- if (is.null(covariates)) Surv(Time, Event) ~ 1 else
-      as.formula(paste("Surv(Time, Event) ~", paste(covariates, collapse = "+")))
-    fit <- survreg(aft_formula, data = data_last, dist = dist)
-    est <- c(fit$coefficients, Scale = fit$scale)
-    names(est)[length(est)] <- "Scale"
-    return(list(
-      coefficients = round(est, 4),
-      logLik = fit$loglik[2],
-      converged = TRUE,
-      time.dependent = FALSE,
-      call = call
-    ))
+  # --- Parse survival formula --- #
+  mf <- model.frame(formula, data)
+  surv_obj <- model.response(mf)
+  if (!inherits(surv_obj, "Surv") || attr(surv_obj, "type") != "counting") {
+    stop("Formula must be of the form Surv(start, stop, event) ~ covariates")
   }
   
-  # Case 2: Time-dependent
-  if (is.null(init)) {
-    init_formula <- as.formula(paste("Surv(Time, Event) ~", paste(covariates, collapse = "+")))
-    init_fit <- survreg(init_formula, data = data_last, dist = dist)
-    init <- list(beta = init_fit$coefficients, scale = init_fit$scale)
+  if (!(id_var %in% names(data))) {
+    stop(paste0("The data must contain the ID variable '", id_var, "'"))
   }
   
-  # Negative log-likelihood
-  neg_log_likelihood <- function(params) {
-    dat <- data[, c(id_var, all_vars)]
-    names(dat) <- c("ID", all_vars)
-    
-    obs_time <- data_last[, c("ID", "Time")]
-    names(obs_time)[2] <- "ObsTime"
-    dat <- merge(dat, obs_time, by = "ID")
-    dat <- dat[order(dat$ID, dat$start), ]
-    
-    Z_mat <- as.matrix(dat[, covariates])
-    beta_vec <- -params[2:(1 + length(covariates))]
-    psi_vec <- (dat$stop - dat$start) * exp(Z_mat %*% beta_vec)
-    psi <- dat %>%
-      mutate(psi = psi_vec) %>%
-      group_by(ID) %>%
-      summarise(psi = sum(psi), .groups = "drop")
-    
-    Z_event <- as.matrix(data_last[, covariates])
-    psi_event <- exp(Z_event %*% beta_vec)
-    
-    merged <- merge(psi, data_last[, c("ID", "Event")], by = "ID")
-    sigma <- params[length(params)]
-    logPsi <- log(merged$psi)
-    logT <- (logPsi - params[1]) / sigma
-    
-    f_event <- dnorm(logT) * psi_event / (sigma * merged$psi)
-    S_censor <- 1 - pnorm(logT)
-    likelihood <- merged$Event * f_event + (1 - merged$Event) * S_censor
-    likelihood <- pmax(likelihood, 1e-20)
-    
-    return(-sum(log(likelihood)))
-  }
+  # --- Check if time-independent --- #
+  id_count <- count(data, !!sym(id_var))
+  is_time_indep <- all(id_count$n == 1)
   
-  # Optimization
-  theta_init <- c(init$beta, init$scale)
-  bound_val <- max(abs(theta_init), na.rm = TRUE) * 10
-  lb <- c(rep(-bound_val, length(theta_init) - 1), 1e-5)
-  ub <- rep(bound_val, length(theta_init))
-  
-  opt_result <- nloptr(
-    x0 = theta_init,
-    eval_f = neg_log_likelihood,
-    lb = lb, ub = ub,
-    opts = list(
-      algorithm = control$algorithm,
-      xtol_rel = control$tol,
-      maxeval = control$maxiter
+  if (is_time_indep) {
+    data$start <- 0
+    data$stop  <- surv_obj[, 2]
+    data$delta <- surv_obj[, 3]
+    formula_ti <- as.formula(
+      paste("Surv(stop, delta) ~", paste(attr(terms(formula), "term.labels"), collapse = " + "))
     )
-  )
+    fit <- survreg(formula_ti, data = data, dist = dist)
+    est_params <- c(fit$coefficients, sigma = fit$scale)
+    names(est_params)[length(est_params)] <- "sigma"
+    return(list(EstBetas = est_params,
+                method = "survreg",
+                message = paste("Time-independent data fitted using survreg() with dist =", dist)))
+  }
   
-  names(opt_result$solution) <- c(paste0("Beta", 0:(length(opt_result$solution) - 2)), "Scale")
+  # --- Prepare design matrix --- #
+  start_time <- surv_obj[, 1]
+  stop_time  <- surv_obj[, 2]
+  event      <- surv_obj[, 3]
+  X_mat_full <- model.matrix(formula, data)
+  X_mat <- X_mat_full[, -1, drop = FALSE]
+  covariate_names <- colnames(X_mat)
   
-  return(list(
-    coefficients = round(opt_result$solution, 4),
-    logLik = -opt_result$objective,
-    converged = opt_result$status > 0,
-    status = opt_result$status,
-    message = opt_result$message,
-    n.iter = opt_result$iterations,
-    time.dependent = TRUE,
-    call = call
-  ))
+  data$start <- start_time
+  data$stop  <- stop_time
+  data$delta <- event
+  for (j in seq_along(covariate_names)) {
+    data[[covariate_names[j]]] <- X_mat[, j]
+  }
+  
+  # --- Initial values --- #
+  if (initi) {
+    init_beta <- beta
+    init_sigma <- sigma_init
+  } else {
+    data_last <- data %>% group_by(.data[[id_var]]) %>% arrange(stop) %>% slice(n()) %>% ungroup()
+    X_last <- as.matrix(data_last[, covariate_names])
+    fit_init <- survreg(Surv(stop, delta) ~ X_last, data = data_last, dist = dist)
+    init_beta <- fit_init$coefficients
+    init_sigma <- fit_init$scale
+  }
+  
+  # --- Negative log-likelihood --- #
+  neg_log_likelihood <- function(params) {
+    intercept <- params[1]
+    betas <- params[2:(length(covariate_names) + 1)]
+    sigma <- params[length(params)]
+    
+    obs_time <- data %>% group_by(.data[[id_var]]) %>% slice(n()) %>% ungroup() %>%
+      select(!!sym(id_var), stop) %>% rename(obs_time = stop)
+    dat_ext <- data %>% left_join(obs_time, by = id_var) %>% arrange(.data[[id_var]], start)
+    
+    Z_mat <- as.matrix(dat_ext[, covariate_names])
+    lin_pred <- -Z_mat %*% betas
+    dat_ext$psi_comp <- (dat_ext$stop - dat_ext$start) * exp(lin_pred)
+    
+    psi_df <- dat_ext %>% group_by(.data[[id_var]]) %>%
+      summarise(psi = sum(psi_comp), .groups = "drop") %>% arrange(.data[[id_var]])
+    
+    Z_last <- dat_ext %>% group_by(.data[[id_var]]) %>% slice(n()) %>%
+      ungroup() %>% select(all_of(covariate_names)) %>% as.matrix()
+    psi_d <- exp(-Z_last %*% betas)
+    
+    delta_df <- dat_ext %>% group_by(.data[[id_var]]) %>% slice(n()) %>%
+      ungroup() %>% select(!!sym(id_var), delta)
+    
+    final_df <- psi_df %>% mutate(psi_d = as.vector(psi_d)) %>%
+      left_join(delta_df, by = id_var) %>% arrange(.data[[id_var]])
+    
+    log_psi <- log(final_df$psi)
+    z <- (log_psi - intercept) / sigma
+    L <- loglik_fn(z, final_df$psi, final_df$psi_d, final_df$delta, sigma)
+    -sum(log(pmax(L, 1.0e-20)))
+  }
+  
+  # --- Optimize using nloptr --- #
+  init_params <- c(init_beta, init_sigma)
+  bound_size <- max(abs(init_params)) * 10
+  lower_bounds <- rep(-bound_size, length(init_params))
+  upper_bounds <- rep(bound_size, length(init_params))
+  
+  res <- nloptr(x0 = init_params,
+                eval_f = neg_log_likelihood,
+                lb = lower_bounds,
+                ub = upper_bounds,
+                opts = list(algorithm = algorithm,
+                            xtol_rel = tol,
+                            maxeval = maxiter))
+  
+  est_params <- res$solution
+  names(est_params) <- c("Intercept", covariate_names, "sigma")
+  
+  return(list(EstBetas = est_params,
+              method = "PAFT_TD",
+              itr = res$iterations,
+              status = res$status,
+              message = res$message))
 }
